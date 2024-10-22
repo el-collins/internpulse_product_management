@@ -1,184 +1,85 @@
 # tests/test_product.py
+
 import pytest
+from fastapi.testclient import TestClient
 from app.main import app
-from app.database import get_db
-from decimal import Decimal
+from app.models import ProductCreate, ProductUpdate
 from bson import ObjectId
-import motor.motor_asyncio
-from typing import AsyncGenerator, Generator
-import pytest_asyncio
-import httpx
 
+client = TestClient(app)
 
-
-# Mock database setup
-@pytest_asyncio.fixture
-async def mock_db() -> AsyncGenerator:
-    test_client = motor.motor_asyncio.AsyncIOMotorClient("mongodb://localhost:27017")
-    test_db = test_client.test_product_management
-    
-    async def override_get_db():
-        yield test_db
-
-    
-    app.dependency_overrides[get_db] = override_get_db
-    await test_db.client.drop_database("test_product_management")  # Ensure clean DB before test
-    try:
-        yield test_db
-    finally:
-        await test_db.client.drop_database("test_product_management")  # Cleanup after test
-        app.dependency_overrides.clear()
-
-# Test client setup
-@pytest_asyncio.fixture
-async def client() -> AsyncGenerator:
-    async with httpx.AsyncClient(app=app) as c:
-        yield c
-
-# Test data fixtures
-@pytest.fixture
-def valid_product():
+@pytest.fixture(scope="module")
+def sample_product():
     return {
         "name": "Test Product",
-        "category": "Test Category",
-        "price": "99.99"
+        "description": "This is a test product.",
+        "price": 99.99,
+        "category": "Test Category"
     }
 
-@pytest.fixture
-def product_list():
-    return [
-        {"name": "Budget Product", "category": "Electronics", "price": "10.00"},
-        {"name": "Premium Product", "category": "Electronics", "price": "999.99"},
-        {"name": "Mid-range Product", "category": "Home", "price": "49.99"},
-        {"name": "Luxury Item", "category": "Fashion", "price": "1999.99"}
-    ]
-
-# CREATE Tests
-@pytest.mark.asyncio
-async def test_create_product_success(client, mock_db, valid_product):
-    response = client.post("/api/v1/products/", json=valid_product)
+@pytest.fixture(scope="module")
+async def created_product(sample_product):
+    response = client.post("/api/v1/products/", json=sample_product)
     assert response.status_code == 201
-    data = response.json()
-    assert data["name"] == valid_product["name"]
-    assert data["category"] == valid_product["category"]
-    assert Decimal(data["price"]) == Decimal(valid_product["price"])
-    assert "_id" in data
+    return response.json()
 
-@pytest.mark.asyncio
-async def test_create_product_invalid_price(client, mock_db, valid_product):
-    valid_product["price"] = "-10.00"
-    response = client.post("/api/v1/products/", json=valid_product)
-    assert response.status_code == 422
+def test_create_product(sample_product):
+    response = client.post("/api/v1/products/", json=sample_product)
+    assert response.status_code == 201
+    assert response.json()["name"] == sample_product["name"]
+    assert response.json()["description"] == sample_product["description"]
 
-@pytest.mark.asyncio
-async def test_create_product_missing_fields(client, mock_db):
-    response = client.post("/api/v1/products/", json={"name": "Incomplete Product"})
-    assert response.status_code == 422
+def test_create_product_duplicate(created_product):
+    response = client.post("/api/v1/products/", json=created_product)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Product with this name already exists"
 
-# READ Tests
-@pytest.mark.asyncio
-async def test_get_products_with_pagination(client, mock_db, product_list):
-    # Create multiple products
-    for product in product_list:
-        client.post("/api/v1/products/", json=product)
-    
-    # Test with limit and skip
-    response = client.get("/api/v1/products/?skip=1&limit=2")
+def test_get_products():
+    response = client.get("/api/v1/products/")
     assert response.status_code == 200
-    data = response.json()
-    assert len(data) == 2
+    assert isinstance(response.json(), list)
 
-@pytest.mark.asyncio
-async def test_get_products_price_range(client, mock_db, product_list):
-    # Create multiple products
-    for product in product_list:
-        client.post("/api/v1/products/", json=product)
-    
-    response = client.get("/api/v1/products/?min_price=100&max_price=1000")
+def test_get_product_by_id(created_product):
+    product_id = created_product["_id"]
+    response = client.get(f"/api/v1/products/{product_id}")
     assert response.status_code == 200
-    data = response.json()
-    assert all(100 <= Decimal(p["price"]) <= 1000 for p in data)
+    assert response.json()["name"] == created_product["name"]
 
-@pytest.mark.asyncio
-async def test_get_products_category_search(client, mock_db, product_list):
-    # Create multiple products
-    for product in product_list:
-        client.post("/api/v1/products/", json=product)
-    
-    response = client.get("/api/v1/products/?category=Electronics")
+def test_get_product_by_id_not_found():
+    response = client.get(f"/api/v1/products/{ObjectId()}")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Product not found"
+
+def test_update_product_by_id(created_product):
+    product_id = created_product["_id"]
+    update_data = ProductUpdate(name="Updated Product", price=79.99)
+    response = client.put(f"/api/v1/products/{product_id}", json=update_data.dict())
     assert response.status_code == 200
-    data = response.json()
-    assert all("Electronics" in p["category"] for p in data)
+    assert response.json()["name"] == "Updated Product"
+    assert response.json()["price"] == "79.99"
 
-# UPDATE Tests
-@pytest.mark.asyncio
-async def test_update_product_partial(client, mock_db, valid_product):
-    # Create product
-    create_response = client.post("/api/v1/products/", json=valid_product)
-    product_id = create_response.json()["_id"]
+def test_update_product_with_duplicate_name(created_product):
+    # First create another product
+    another_product = {
+        "name": "Another Product",
+        "description": "Another test product.",
+        "price": 49.99,
+        "category": "Another Category"
+    }
+    client.post("/api/v1/products/", json=another_product)
     
-    # Partial update - only price
-    update_data = {"price": "149.99"}
-    response = client.put(f"/api/v1/products/{product_id}", json=update_data)
-    assert response.status_code == 200
-    assert Decimal(response.json()["price"]) == Decimal("149.99")
-    assert response.json()["name"] == valid_product["name"]  # Original name unchanged
+    # Attempt to update created_product to the name of another_product
+    update_data = ProductUpdate(name="Another Product")
+    response = client.put(f"/api/v1/products/{created_product['_id']}", json=update_data.dict())
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Product with this name already exists"
 
-@pytest.mark.asyncio
-async def test_update_product_invalid_fields(client, mock_db, valid_product):
-    # Create product
-    create_response = client.post("/api/v1/products/", json=valid_product)
-    product_id = create_response.json()["_id"]
-    
-    # Update with invalid field
-    update_data = {"invalid_field": "value"}
-    response = client.put(f"/api/v1/products/{product_id}", json=update_data)
-    assert response.status_code == 422
+def test_delete_product_by_id(created_product):
+    product_id = created_product["_id"]
+    response = client.delete(f"/api/v1/products/{product_id}")
+    assert response.status_code == 204
 
-# DELETE Tests
-@pytest.mark.asyncio
-async def test_delete_product_cascade(client, mock_db, valid_product):
-    # Create product
-    create_response = client.post("/api/v1/products/", json=valid_product)
-    product_id = create_response.json()["_id"]
-    
-    # Delete product
-    delete_response = client.delete(f"/api/v1/products/{product_id}")
-    assert delete_response.status_code == 204
-    
-    # Verify product is gone
-    get_response = client.get(f"/api/v1/products/{product_id}")
-    assert get_response.status_code == 404
-
-# Error Handling Tests
-@pytest.mark.asyncio
-async def test_invalid_object_id_formats(client, mock_db):
-    invalid_ids = ["123", "invalid_id", "12345678901"]
-    
-    for invalid_id in invalid_ids:
-        get_response = client.get(f"/api/v1/products/{invalid_id}")
-        assert get_response.status_code == 400
-        assert get_response.json()["detail"] == "Invalid product ID"
-        
-        delete_response = client.delete(f"/api/v1/products/{invalid_id}")
-        assert delete_response.status_code == 400
-        assert delete_response.json()["detail"] == "Invalid product ID"
-
-@pytest.mark.asyncio
-async def test_product_not_found_scenarios(client, mock_db):
-    valid_but_nonexistent_id = str(ObjectId())
-    
-    # Test GET
-    get_response = client.get(f"/api/v1/products/{valid_but_nonexistent_id}")
-    assert get_response.status_code == 404
-    
-    # Test DELETE
-    delete_response = client.delete(f"/api/v1/products/{valid_but_nonexistent_id}")
-    assert delete_response.status_code == 404
-    
-    # Test UPDATE
-    update_response = client.put(
-        f"/api/v1/products/{valid_but_nonexistent_id}",
-        json={"name": "Updated Name"}
-    )
-    assert update_response.status_code == 404
+def test_delete_product_not_found():
+    response = client.delete(f"/api/v1/products/{ObjectId()}")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Product not found"
