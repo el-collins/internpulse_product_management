@@ -73,6 +73,5 @@ tzdata==2024.1
 urllib3==1.26.20
 userpath==1.9.2
 uvicorn==0.27.1
-virtualenv==20.21.1
 webencodings==0.5.1
 Werkzeug==3.0.1
